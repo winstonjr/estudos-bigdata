@@ -1,0 +1,204 @@
+---
+title: "Descoberta dos caminhos mais provavéis em uma URA"
+output: html_notebook
+---
+
+## Introdução
+
+Hoje o mercado de Unidades de Resposta Audível (URA) é bastante carente de ferramentas para auxiliar na analise e visualização dos itens mais frequentemente utilizados. Essa analise auxilia na melhoria das experiências com o usuário final, que está cada vez mais exigente e faz com que a marca seja percebida no mercado de uma forma mais atrativa.
+Hoje o trabalho de melhoria desse canal é um grande ofensor da experiência com o usuário porque além de ser financeiramente custoso ele também exige uma atenção quase que exclusiva do interlocutor com o mesmo implicando em um ônus cognitivo relevante para o usuário.
+Oferecer fluxos mais otimizados por usuário pode diminuir esse ônus e tornar o usuário um promotor da marca. A idéia central é ajudar de forma mais ágil na analise dessas informações.
+
+## Referencial teórico
+
+A descoberta de conhecimento em banco de dados (KDD) é um processo bastante conslidado que inclui geralmente quatro partes principais. A escolha da base de dados, o pré-processamento da informação a mineração de dados propriamente dita e a validação dos resultados encontrados com a mesma.
+
+## Metodologia
+
+Como falado anteriormente escolhemos usar KDD para descobrir regras de associação e iremos descrever os passos utilizados abaixo.
+
+### Base de Dados
+
+A base de dados é uma coleção organizada de dados, num nível que permita a recuperação das mesmas, e que faça com que seja possível ter uma abstração bem básica dos dados.
+Para este trabalho foi escolhida uma base que contém informações de navegação de URA colhidas em dois dias de janeiro do ano 2018. Essas informações são transacionais e compostas por um ID e uma lista semi estruturada de transações.
+
+### Pré-processamento dos dados
+
+São passos anteriores a mineração que auxiliam na limpeza e transformação dos dados para um formato que faça com que a mineração seja mais eficiente. Essa etapa inclio passos de limpeza, integração, seleção e a transformação.
+
+#### Limpeza
+
+A limpeza dos dados consiste na remoção de ruídos e dados inconsistentes da base de dados. Não foi necessário limpar os dados no nosso cenário.
+
+#### Integração
+
+É a combinação de dados obtidas de diversas fontes para tornar o mesmo mais coerente antes da analise.
+Usamos dados de duas fontes. Um excel transformado em CSV com a descrição dos passos executados na ura e os dados da tabela de transação em sí da URA.
+Esses dois dados foram transformados em um arquivo resultando em um objeto sendo transformado em diversos objetos com dados das transações expandidas para facilitar a execução do algoritmo.
+Essa parte do processo foi adicionada feita por um código externo ao R. Disponível no [github]([https://github.com/winstonjr/estudos-bigdata).
+
+#### Seleção
+
+É a escolha dos dados relevantes à analise. Nesse caso todos os dados eram relevantes para a analise e foram usados na mesma.
+
+#### Transformação
+
+Consiste na consolidação dos dados em formatos apropriados para a mineração. Essa fase foi executada neste mesmo R notebook e está indicado abaixo.
+
+### Mineração de dados
+
+Corresponde a aplicação de algoritmos capazes de extrair conhecimento a partir de dados pré-processados. Escolhi uma técnica de associação de informação, mais especificamente o algoritmo FP-Growth, para aplicar essas validações e geração das regras de associação.
+Existem duas formas mais comuns de montagem das informações dessa tabela: matriz de itens e lista de transações.
+Para os dados foi usado uma tabela com listas de transações análoga com a abaixo:
+
+items        | transaction ID list
+-------------|------------------------
+undefined    | 1, 2, 3, 4
+identificado | 2, 7, 9
+
+Isso faz com que o dataset fique mais enxuto do ponto de vista de tamanho.
+
+### Resultados (Avaliação ou validação do conhecimento) 
+
+Os resultados apresentados pela execução das etapas abaixo não foram definitivos em confirmar a eficiência da aplicação do algoritmo FP-Growth para a minheração de regras de associação em dados de uma URA.
+
+### Configuração do ambiente
+```{r}
+if (!require("sparklyr")) { install.packages("sparklyr") }
+if (!require("dplyr")) { install.packages("dplyr") }
+if (!require("visNetwork")) { install.packages("visNetwork") }
+
+library(sparklyr)
+library(dplyr)
+library(visNetwork)
+
+if (nchar(Sys.getenv("SPARK_HOME")) < 1) {
+  Sys.setenv(SPARK_HOME = "/home/rstudio/.cache/spark/spark-2.3.0-bin-hadoop2.7")
+}
+
+sc <- spark_connect(master = "local")
+```
+
+### Transformação dos dados para um formato aceito pelo sparklyr
+```{r}
+tm <- spark_read_csv(sc, name = "tm", path="/home/rstudio/tarefas/bigdata/trabalho/dados/transactionlistexpand.csv", header=TRUE, infer_schema=TRUE, delimiter=",", charset = "UTF-8")
+
+transactiontable  = copy_to(sc, tm, overwrite = TRUE)
+
+aggregateddata = transactiontable %>% 
+   group_by(id) %>% 
+   summarise(
+      items = collect_list(node)
+   )
+
+#head(aggregatedata)
+```
+
+### Configura o algoritmo a ser utilizado para minear os dados mais frequentes
+```{r}
+uid = sparklyr:::random_string("fpgrowth_")
+jobj = invoke_new(sc, "org.apache.spark.ml.fpm.FPGrowth", uid)
+
+ml_fpgrowth = function(
+  x, 
+  features_col = "items",
+  support = 0.01,
+  confidence = 0.01
+){
+  ensure_scalar_character(features_col)
+  ensure_scalar_double(support)
+  ensure_scalar_double(confidence)
+  
+  sc = spark_connection(x)
+  uid = sparklyr:::random_string("fpgrowth_")
+  jobj = invoke_new(sc, "org.apache.spark.ml.fpm.FPGrowth", uid) 
+  
+  jobj %>% 
+    invoke("setItemsCol", features_col ) %>%
+    invoke("setMinConfidence", confidence) %>%
+    invoke("setMinSupport", support)  %>%
+    invoke("fit", spark_dataframe(x))
+}
+
+ml_fpgrowth_extract_rules = function(FPGmodel, nLHS = 2, nRHS = 1)
+{
+  rules = FPGmodel %>% invoke("associationRules")
+  sdf_register(rules, "rules")
+  
+  exprs1 <- lapply(
+    0:(nLHS - 1), 
+    function(i) paste("CAST(antecedent[", i, "] AS string) AS LHSitem", i, sep="")
+  )
+  exprs2 <- lapply(
+    0:(nRHS - 1), 
+    function(i) paste("CAST(consequent[", i, "] AS string) AS RHSitem", i, sep="")
+  )
+  
+  splittedLHS = rules %>% invoke("selectExpr", exprs1) 
+  splittedRHS = rules %>% invoke("selectExpr", exprs2) 
+  p1 = sdf_register(splittedLHS, "tmp1")
+  p2 = sdf_register(splittedRHS, "tmp2")
+  
+  ## collecting output rules to R should be OK and not flooding R
+  bind_cols(
+    sdf_bind_cols(p1, p2) %>% collect(),
+    rules %>% collect() %>% select(confidence)
+  )
+}
+
+plot_rules = function(rules, LHS = "LHSitem0", RHS = "RHSitem0", cf = 0.2)
+{
+  rules = rules %>% filter(confidence > cf)
+  nds = unique(
+    c(
+      rules[,LHS][[1]],
+      rules[,RHS][[1]]
+    )
+  )
+  
+  nodes = data.frame(id = nds, label = nds, title = nds) %>% arrange(id)
+  
+  edges = data.frame(
+    from =  rules[,LHS][[1]],
+    to = rules[,RHS][[1]]
+  )
+  visNetwork(nodes, edges, main = "Groceries network", size=1) %>%
+    visOptions(highlightNearest = TRUE, nodesIdSelection = TRUE) %>%
+    visEdges(smooth = FALSE) %>%
+    visPhysics(
+      solver = "barnesHut", 
+      forceAtlas2Based = list(gravitationalConstant = -20, maxVelocity = 1)
+    )
+}
+```
+
+### Executa o algoritmo que tentará descobrir as regras de associação
+```{r}
+FPGmodel = jobj %>% 
+    invoke("setItemsCol", "items") %>%
+    invoke("setMinConfidence", 0.7) %>%
+    invoke("setMinSupport", 0.7)  %>%
+    invoke("fit", spark_dataframe(aggregateddata))
+
+rules = FPGmodel %>% invoke("associationRules")
+
+urarules =  ml_fpgrowth(aggregateddata) %>%
+  ml_fpgrowth_extract_rules()
+
+head(urarules, 200)
+
+plot_rules(urarules)
+```
+
+## Considerações finais
+
+O resultado do trabalho não chegou a uma conclusão efetiva sobre a posibilidade do uso do algoritmo FP-Growth em um dataset de URA.
+As regras mineradas por esse algoritmo são muito influenciadas pela frequencia de aparição dos itens nas transações e o ponto de entrada do usuário em uma URA é quase sempre o mesmo. Isso faz com que a entrada da URA implique, na maioria absoluta dos casos, em qualquer outro item da mesma deixando o resultado enviesado.
+Gostaria de ter entregue uma visualização do tipo Sankey mostrando todas as implicações das informações e deixando claro o resultado. Como muitas das implicações eram muito repetidas isso, infelizmente não foi possível.
+Existem muitas oportunidades de automatização nesse mercado e isso é um filão pouco explorado pelas empresas que atuam nesse negócio. Esse trabalho de geração de insights é manual, repetitivo e muito sucetível a falhas pela dificuldade de analise da quantidade de dados disponível.
+
+## Apendice: fontes usadas para a execução e pesquisa do trabalho
+
+arules – A Computational Environment for Mining Association Rules and Frequent Item Sets (Journal of Statistical Software - October 2005, Volume 14, Issue 15.)
+https://longhowlam.wordpress.com/tag/market-nasket/
+Introdução à Mineração de dados: Conceitos Básicos, Algoritmos e Aplicações - Leandro Nunes
